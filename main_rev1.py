@@ -35,7 +35,7 @@ def rolling_slope(series, window):
 
     def slope(y):
         m, _ = np.polyfit(x, y, 1)
-        return abs(m*window)  #absolute slope
+        return (m*window)  #absolute slope
 
     return series.rolling(window).apply(slope, raw=True)
 
@@ -81,6 +81,7 @@ def walk_forward_drift_signal(
     results = []
 
     for current_date in df_resampled.loc[date_search:].index:
+        print(current_date)
         # ---------- Anchor master tag ----------
         master_val = df_resampled.at[current_date, master_tag]
         low = master_val * (1 - pct_range)
@@ -105,13 +106,18 @@ def walk_forward_drift_signal(
         )
 
         # ---------- Remove extreme master-tag points ----------
+        df_scaled = df_scaled[
+            (df_scaled.abs() <= 4).all(axis=1)
+        ]
+        
+        
         df_scaled = df_scaled.loc[
             (df_scaled[master_tag] >= -threshold) &
             (df_scaled[master_tag] <= threshold)
         ]
         
         # ---------- Minimum data check ----------
-        if len(df_scaled) < slope_window:
+        if len(df_scaled) < slope_window-(len(hist_df)-len(df_scaled)) and slope_window-(len(hist_df)-len(df_scaled)) >20 :
             row = {}
             for col in df_resampled.select_dtypes(include="number").columns:
                 row[f"{col}_value"] = df_resampled.at[current_date, col]
@@ -132,56 +138,60 @@ def walk_forward_drift_signal(
 
         for col in df_scaled.select_dtypes(include="number").columns:
             slope_df[col] = (
-                rolling_slope(df_scaled[col], slope_window) / df_scaled[col]
+                rolling_slope(df_scaled[col], ( slope_window-(len(hist_df)-len(df_scaled)))) / df_scaled[col]
             ) * 100
 
         # ---------- Signal + value ----------
         row = {}
 
         for col in df_scaled.select_dtypes(include="number").columns:
-
+            print(col)
+        
             # Tag value at current date
             row[f"{col}_value"] = df_resampled.at[current_date, col]
-
+        
             # Current slope
             current_slope = slope_df[col].iloc[-1]
+            abs_current_slope = abs(current_slope)
             row[f"{col}_pct_change"] = current_slope
-
+        
             # ---------- Thresholds ----------
             if (col in sens_df.index and
                 pd.notna(sens_df.at[col, "max_pct"])):
-
-                raw_min_pct = sens_df.at[col, "max_pct"]/3
+        
+                raw_min_pct = sens_df.at[col, "max_pct"] / 3
                 raw_max_pct = sens_df.at[col, "max_pct"]
             else:
-                raw_min_pct = max_pct/3
+                raw_min_pct = max_pct / 3
                 raw_max_pct = max_pct
-
+        
             # ---------- Enforce min = max/3 rule ----------
             tag_max_pct = raw_max_pct
             tag_min_pct = max(raw_min_pct, raw_max_pct / 3)
-
-            # ---------- Rolling consistency ----------
+        
+            # ---------- Rolling consistency (ABS) ----------
             last_n_all_gt_min = (
-                (slope_df[col] > tag_min_pct)
+                (slope_df[col].abs() > tag_min_pct)
                 .rolling(data_check_window, min_periods=data_check_window)
                 .min()
                 .iloc[-1]
             )
-
-            # ---------- Signal logic ----------
-            if current_slope < tag_min_pct:
+        
+            # ---------- Signal logic (ABS) ----------
+            if abs_current_slope < tag_min_pct:
                 signal = 0
-            elif current_slope > tag_max_pct:
+            elif abs_current_slope > tag_max_pct:
                 signal = 2
-            elif tag_min_pct <= current_slope <= tag_max_pct and last_n_all_gt_min:
+            elif tag_min_pct <= abs_current_slope <= tag_max_pct and last_n_all_gt_min:
                 signal = 1
             else:
                 signal = 0
-
+        
             row[f"{col}_alert"] = signal
-
+        
         results.append(pd.DataFrame(row, index=[current_date]))
+
+        # results.append(pd.DataFrame(row, index=pd.Index([current_date], name="timestamp")))
 
     # if not results:
     row = {}
@@ -220,6 +230,56 @@ def drift_data(schema, alertx_id,db_connection,SOR,time_upto):
     
     return drift_check_df
 
+def desc(schema,alertx_id):
+    desc_query = f'''
+        SELECT 
+            a.alias_name,
+            a.description, 
+            a.tag_name, 
+            b.tag_name AS IP21_Tag,
+            b.uom,
+            'taglist' AS tag_source
+        FROM {schema}.alertx_system_config a
+        LEFT JOIN {schema}.icap_independent_table_taglist b
+            ON a.tag_name = b.alias
+        WHERE a.alertx_id = {alertx_id}
+    
+        UNION ALL
+    
+        SELECT 
+            a.alias AS alias_name,
+            a.description,
+            NULL AS tag_name,
+            NULL AS IP21_Tag,
+            NULL AS uom,
+            'calculated tag' AS tag_source
+        FROM {schema}.alertx_system_config_calculation_tag a
+        LEFT JOIN {schema}.icap_independent_table_calculationtag calc
+            ON a.alias = calc.alias
+        WHERE a.alertx_id = {alertx_id}
+        '''
+        
+    desc_df = pd.read_sql(desc_query, db_connection)
+    desc_df = desc_df.fillna("")
+    
+    return desc_df
+
+def make_alias_unique(df, alias_col='alias'):
+    df = df.copy()
+    df[alias_col] = (
+        df.groupby(alias_col).cumcount()
+        .astype(str)
+        .radd('_')
+        .where(df.duplicated(alias_col, keep=False), '')
+        .radd(df[alias_col])
+    )
+    return df
+
+def replace_alias_with_desc(col):
+    for alias, desc in sorted_aliases:
+        if col == alias or col.startswith(alias + "_"):
+            return col.replace(alias, desc, 1)
+    return col
 
 
 ################################ READ CONFIG FILES ################################
@@ -260,8 +320,7 @@ for k , eqpt in eqpt_df.iterrows():
     f"{user}_{schema}_alertx_id_{alertx_id}_alert_data_"
     f"{start_time_dt.strftime('%Y-%m-%d')}"
     f"_to_"
-    f"{end_time_dt.strftime('%Y-%m-%d')}.xlsx"
-)
+    f"{end_time_dt.strftime('%Y-%m-%d')}.xlsx")
 # alert_output_path = "output/alert_data.xlsx"
 
     # Initialize database connection
@@ -303,11 +362,137 @@ for k , eqpt in eqpt_df.iterrows():
     daily_drift_alerts = daily_drift_alerts.sort_index()
     
     
+    results_df = daily_drift_alerts  # for Summary DF making
+    
+    #--------- Call Description Mapping DF--------#
+    desc_df = desc(schema,alertx_id)
+    desc_df   = make_alias_unique(desc_df, alias_col='description')
+    
+    
+    #--------- Create Dict of Alias to COrreponding DICT-----------#
+    alias_to_desc = (
+        desc_df
+        .dropna(subset=["alias_name", "description"])
+        .set_index("alias_name")["description"]
+        .to_dict()
+    )
+
+    # longest alias first to avoid partial replacement
+    sorted_aliases = sorted(alias_to_desc.items(), key=lambda x: len(x[0]), reverse=True)
+    
+    results_df.columns = [replace_alias_with_desc(c) for c in results_df.columns]
+    
+    
+    #---------------------- GENERATION OF SUMMARY--------------------#
+    summary_dict = {}
+    desc_df = desc_df.set_index('description')
+    for col in results_df.columns:
+        if not col.endswith("_alert"):
+            continue
+
+        tag = col.replace("_alert", "")
+        alert_col = f"{tag}_alert"
+        value_col = f"{tag}_value"
+        pct_col   = f"{tag}_pct_change"
+
+        # Filter rows where alert is NOT 0 or 3or 4
+        df_tag = results_df.loc[~results_df[alert_col].isin([0, 3, 4])].copy() # 0-No alert , 3-No Sufficient Data , 4-Offline
+        if df_tag.empty:
+            continue
+        
+        tag_label = f"{tag} ({desc_df.loc[tag,'IP21_Tag']})".rstrip(" ()")
+
+        # Determine trend
+        trend = pd.Series(
+            np.where(df_tag[pct_col] > 0, "increasing", "decreasing"),
+            index=df_tag.index
+        )
+
+        # Base calculations
+        typical_value = (df_tag[value_col] * (1 + (df_tag[pct_col] / 100))).round(2)
+        current_value = df_tag[value_col].round(2)
+
+        # # Swap values if trend is decreasing
+        # typical_value = pd.Series(
+        #     np.where(trend == "decreasing", current_calc, typical_calc),
+        #     index=df_tag.index
+        # )
+        
+
+        # current_value = pd.Series(
+        #     np.where(trend == "decreasing", typical_calc, current_calc),
+        #     index=df_tag.index
+        # )
+
+        # Timestamp text
+        timestamps = df_tag.index.to_series().dt.strftime("%d-%m-%Y")
+
+        # Build alert sentences
+        sentences = (
+            tag_label
+            + " is indicating an "
+            + trend
+            + " trend from its typical value "
+            + current_value.astype(str)
+            + f" {desc_df.loc[tag,'uom']} to "
+            + typical_value.astype(str)
+            + f" {desc_df.loc[tag,'uom']} on "
+            + timestamps
+        )
+
+        # Store sentences
+        for ts, text in sentences.items():
+            summary_dict.setdefault(ts, []).append(text)
+
+
+    summary_df = pd.DataFrame(
+        {
+            "message": [
+                msg
+                for msgs in summary_dict.values()
+                for msg in msgs
+            ]
+        },
+        index=pd.Index(
+            ["Drift Alert"] * sum(len(v) for v in summary_dict.values()),
+            name="Alert type"
+        )
+    )
+    
     with pd.ExcelWriter(alert_output_path) as writer:
         daily_drift_alerts.to_excel(writer, sheet_name="drift_alerts", index=True)
+        summary_df.to_excel(writer, sheet_name="Drift Summary", index=True)
         drift_daily_data.to_excel(writer, sheet_name="drift_daily_data", index=True)
+        
+#-----------------------------------------------------------------------------------------------------------------
+
+
+#
 
 
 
 
 
+
+
+#-----------------------------------------------------
+
+    
+# alias_to_desc = (
+#     desc_df
+#     .dropna(subset=["alias_name", "description"])
+#     .set_index("alias_name")["description"]
+#     .to_dict()
+# )
+
+# def replace_alias_with_desc(col):
+#     for alias, desc in alias_to_desc.items():
+#         if col.startswith(alias):
+#             return col.replace(alias, desc, 1)
+#     return col
+
+
+
+
+
+# daily_drift_alerts.columns = [replace_alias_with_desc(c) for c in daily_drift_alerts.columns]
